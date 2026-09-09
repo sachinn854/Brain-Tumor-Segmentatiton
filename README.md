@@ -7,55 +7,38 @@ Approach: replicate an IEEE Transactions (2024+) base model exactly, then add an
 
 ---
 
-## 📄 Documents — is order me padho
-
-| File | Kya hai |
-|---|---|
-| [`docs/00-MASTER-PLAN.md`](docs/00-MASTER-PLAN.md) | **Week-by-week plan** — August se December tak, 21 weeks |
-| [`docs/01-PAPER-TYPES-EXPLAINED.md`](docs/01-PAPER-TYPES-EXPLAINED.md) | Journal vs **Transactions** vs Conference ka farak + IEEE Xplore pe search kaise karein |
-| [`docs/02-SHORTLISTED-PAPERS.md`](docs/02-SHORTLISTED-PAPERS.md) | 5 shortlisted **IEEE Transactions papers (2024+)** + base model recommendation |
-| [`docs/03-THURSDAY-MEETING-SCRIPT.md`](docs/03-THURSDAY-MEETING-SCRIPT.md) | 13 Aug guide meeting me **exactly kya bolna hai** |
-| [`docs/07-TIP-NORMAL-BRAIN-BOOST-BREAKDOWN.md`](docs/07-TIP-NORMAL-BRAIN-BOOST-BREAKDOWN.md) | ⭐ **Option A** — Normal-Brain-Boost (IEEE TIP 2024). 2 modules, idea ek line ka, 2.5D input |
-| [`docs/06-S2CA-Net-SIMPLE-VERSION.md`](docs/06-S2CA-Net-SIMPLE-VERSION.md) | ⭐ **Option B** — S²CA-Net (IEEE TMI 2024). 3 modules, par single pipeline aur single dataset |
-| [`docs/04-S2CA-Net-PAPER-BREAKDOWN.md`](docs/04-S2CA-Net-PAPER-BREAKDOWN.md) | S²CA-Net ka **detailed** breakdown — Week 6 me code likhte waqt kholna, abhi nahi |
-| [`docs/05-UNETR-PLUSPLUS-PAPER-BREAKDOWN.md`](docs/05-UNETR-PLUSPLUS-PAPER-BREAKDOWN.md) | UNETR++ ka breakdown — sirf 1 block, par general paper hai (purely brain tumor nahi). Backup |
-| [`docs/PROGRESS.md`](docs/PROGRESS.md) | Daily log — **roz 3 line likhna** |
-
----
-
 ## Current status
 
-**Phase 0 — Literature Review** · Week 1 of 21
+**Base paper:** **WAS-Mamba** — *Windowed Attention State Space Model for 3D Medical Image Segmentation*, IEEE Transactions on Image Processing, vol. 35, 2026. Mamba/state-space architecture; evaluated across 5 datasets (Synapse, BTCV, ACDC, BraTS, Decathlon-Lung) — this project uses only its BraTS setup.
 
-- Proposed base paper: **UNETR++** — *Delving Into Efficient and Accurate 3D Medical Image Segmentation*, IEEE Transactions on Medical Imaging, vol. 43, no. 9, pp. 3377–3390, 2024. Chuna kyunki isme sirf **ek naya block (EPA)** hai — ek semester me reproduce karna realistic hai
-- Backup: **S²CA-Net**, IEEE TMI, vol. 43, no. 7, pp. 2495–2508, 2024 — purely brain tumor ka paper, par 3 naye modules hain
-- Dataset: BraTS 2020 / 2021
-- Status: guide ki approval pending (Thu 13 Aug)
-
----
-
-## Phases
-
-| Phase | Weeks | Output |
-|---|---|---|
-| 0 — Literature | 1–2 | Base paper locked + method samjha |
-| 1 — Setup & Data | 3–5 | GPU env + BraTS pipeline + U-Net sanity run |
-| 2 — Base Model | 6–9 | Paper ka model exactly reproduced |
-| 3 — Validation | 10–12 | Numbers paper ke ±2-3% me + limitations documented |
-| 4 — Contribution | 13–17 | Mera improvement + ablation study |
-| 5 — Delivery | 18–20 | Report + PPT + demo |
-| Buffer | 21 | Submission |
+- Guide approval: pending
+- Contribution idea: not finalized yet
+- Base-model code scaffold: done (`src/`) — architecture, loss, BraTS data loader, and hyperparameters cross-checked against the paper (see file-level comments in `src/configs/wasmamba_config.py` for exactly what's paper-confirmed vs. inferred)
+- Not yet done: real training run (blocked on GPU access beyond local dev/debug — see that config file's comments), data augmentation pipeline
 
 ---
 
-## Folder structure
+## Folder structure (this repo)
 
 ```
-├── docs/         planning aur notes
-├── papers/       downloaded PDFs
-├── data/         BraTS dataset (gitignored)
-├── notebooks/    exploration
-├── src/          models, data, losses, train.py
-├── results/      tables, figures, logs
-└── report/       final report
+src/
+├── models/wasmamba.py       WAS-Mamba architecture
+├── losses/losses.py         Loss functions, incl. the paper's Dice+CE loss
+├── data/brats_dataset.py    BraTS PyTorch Dataset (written from scratch —
+│                             not part of the paper's public code release)
+├── utils/                   Training utilities (seed, optimizer, scheduler,
+│                             logging) and evaluation metrics
+└── configs/wasmamba_config.py  Training config, hyperparameters
 ```
+
+Planning notes, downloaded papers, and the literature review are kept locally only (not pushed here).
+
+---
+
+## Setup
+
+```bash
+pip install torch einops timm mamba-ssm causal-conv1d
+```
+
+`mamba-ssm`'s CUDA kernels are Linux-targeted; on Windows, use WSL2 or run on Colab/a Linux GPU box.
