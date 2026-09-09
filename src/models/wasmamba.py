@@ -368,22 +368,39 @@ class WSSM(nn.Module):
         return D
 
     def forward_corev0(self, x: torch.Tensor):
+        # --- FIXED 2026-09-08: torch.nn.Unfold/Fold only accept a 2-element
+        # kernel_size and a genuinely 4D (N, C, H, W) input -- the original
+        # repo passed a 3-element kernel_size (1, 1, W/8) into a 3D input
+        # (x.flatten(2) gives (B, C, L), not 4D), which crashes on current
+        # PyTorch ("It is expected kernel_size equals to 2, but got size 3").
+        # This was never caught by the authors because the repo's own
+        # test.py never actually ran (see the missing datasets/engine_synapse
+        # imports flagged in src/configs/wasmamba_config.py) -- this code
+        # path looks like it was never executed end-to-end even by them.
+        #
+        # Fix: treat the flattened length-L sequence as a fake "1 x L" image
+        # so Unfold's 2D API applies, with kernel_size=(1, window_size) doing
+        # the same window-chunking the paper describes (Section III-C).
+        # Reconstructed from architectural intent, not verified against the
+        # authors' original working code (they never released one) -- flag
+        # this if BraTS numbers don't come close to the paper's reported ones.
         self.selective_scan = selective_scan_fn
         B, C, D, H, W = x.shape
         n = 8
-        self.patchconv = torch.nn.Unfold(kernel_size=(1, 1, int(W / 8)), stride=(1, 1, int(W / 8))).to(x.device)
-        self.unpatchconv = torch.nn.Fold(output_size=(D, H, W), kernel_size=(1, 1, int(W / 8)), stride=(1, 1, int(W / 8))).to(x.device)
+        window = int(W / 8)
+        self.patchconv = torch.nn.Unfold(kernel_size=(1, window), stride=(1, window)).to(x.device)
+        self.unpatchconv = torch.nn.Fold(output_size=(1, D * H * W), kernel_size=(1, window), stride=(1, window)).to(x.device)
         L = D * H * W
         K = 4
 
         if W % 8 == 0:
-            xtf = self.patchconv(x.flatten(2))
+            xtf = self.patchconv(x.flatten(2).unsqueeze(2))
             swinx = torch.roll(x, shifts=(0, 0, int(W / 8 / 2)), dims=(2, 3, 4))
-            xtfswinx = self.patchconv(swinx.flatten(2))
+            xtfswinx = self.patchconv(swinx.flatten(2).unsqueeze(2))
             xt = x.transpose(3, 4).flip(dims=(3, 4))
-            xtb = self.patchconv(xt.flatten(2))
+            xtb = self.patchconv(xt.flatten(2).unsqueeze(2))
             swiny = torch.roll(xt, shifts=(0, 0, int(W / 8 / 2)), dims=(2, 3, 4))
-            xtbswiny = self.patchconv(swiny.flatten(2))
+            xtbswiny = self.patchconv(swiny.flatten(2).unsqueeze(2))
             xs = torch.stack((xtf, xtfswinx, xtb, xtbswiny), dim=1)
         else:
             xtf = x
