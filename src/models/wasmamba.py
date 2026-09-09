@@ -31,8 +31,17 @@ from timm.models.layers import DropPath, trunc_normal_, to_3tuple
 
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
-except:
-    pass
+except ImportError as _mamba_ssm_import_error:
+    # Original repo had a bare `except: pass` here, which silently swallowed
+    # this failure -- the real symptom then only showed up much later as a
+    # confusing `NameError: name 'selective_scan_fn' is not defined` deep
+    # inside forward_corev0(), instead of a clear import error up front.
+    # Fixed to fail loudly and immediately instead.
+    selective_scan_fn = None
+    selective_scan_ref = None
+    print(f"WARNING: mamba_ssm.ops.selective_scan_interface failed to import "
+          f"({_mamba_ssm_import_error}). WASMamba's forward pass will crash "
+          f"with a NameError until mamba_ssm is installed correctly.")
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 
