@@ -1,0 +1,45 @@
+# Dataset — kabhi git me mat daalna (BraTS ~50GB+)
+/data/
+*.nii
+*.nii.gz
+*.h5
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+
+# Personal folders — not for the repo
+/docs/
+/review/
+/architecture/
+/mamba/
+/papers/
+/report/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs
+runs/
+wandb/
+lightning_logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
