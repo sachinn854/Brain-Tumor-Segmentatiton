@@ -148,11 +148,20 @@ class PatchMerging(nn.Module):
 
 
 class PatchExpand(nn.Module):
+    # FIXED 2026-09-08: the original code expanded by dim_scale**3 (8x) but
+    # then normalized to self.dim // dim_scale channels afterward -- those
+    # two don't agree (8x expand split across p1*p2*p3=8 spatial positions
+    # leaves channel count UNCHANGED, not halved, so `self.norm` received
+    # the wrong size). Checked the math: dim_scale**2 (4x) is what actually
+    # produces self.dim // dim_scale channels per spatial position, matching
+    # what `self.norm` expects. Also fixed `c=` in rearrange to use the
+    # module's own known dims instead of the pre-expand input's C, which
+    # was never correct once the expand ratio was wrong to begin with.
     def __init__(self, dim, dim_scale=2, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim * 2
         self.dim_scale = dim_scale
-        self.expand = nn.Linear(self.dim, dim_scale ** 3 * self.dim, bias=False)
+        self.expand = nn.Linear(self.dim, dim_scale ** 2 * self.dim, bias=False)
         self.norm = norm_layer(self.dim // dim_scale)
 
     def forward(self, x):
@@ -162,18 +171,19 @@ class PatchExpand(nn.Module):
             x,
             'b d h w (p1 p2 p3 c)-> b (d p1) (h p2) (w p3) c',
             p1=self.dim_scale, p2=self.dim_scale, p3=self.dim_scale,
-            c=C // (self.dim_scale ** 3)
+            c=self.dim // self.dim_scale
         )
         x = self.norm(x)
         return x
 
 
 class Final_PatchExpand(nn.Module):
+    # Same fix as PatchExpand above -- identical bug, same reasoning.
     def __init__(self, dim, dim_scale=2, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
         self.dim_scale = dim_scale
-        self.expand = nn.Linear(self.dim, dim_scale ** 3 * self.dim, bias=False)
+        self.expand = nn.Linear(self.dim, dim_scale ** 2 * self.dim, bias=False)
         self.norm = norm_layer(self.dim // dim_scale)
 
     def forward(self, x):
@@ -183,7 +193,7 @@ class Final_PatchExpand(nn.Module):
             x,
             'b d h w (p1 p2 p3 c)-> b (d p1) (h p2) (w p3) c',
             p1=self.dim_scale, p2=self.dim_scale, p3=self.dim_scale,
-            c=C // (self.dim_scale ** 3)
+            c=self.dim // self.dim_scale
         )
         x = self.norm(x)
         return x
