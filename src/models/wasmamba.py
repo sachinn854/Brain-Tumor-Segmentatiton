@@ -392,6 +392,15 @@ class WSSM(nn.Module):
         self.unpatchconv = torch.nn.Fold(output_size=(1, D * H * W), kernel_size=(1, window), stride=(1, window)).to(x.device)
         L = D * H * W
         K = 4
+        # FIXED 2026-09-08: the original code reshaped to a HARDCODED
+        # `n*n*n` (=512) window count here, but the actual number of windows
+        # patchconv produces is L // window, which only equals 512 at one
+        # specific spatial resolution (checked: only the deepest encoder
+        # stage, 8x8x8, happens to satisfy this by coincidence -- every
+        # other stage's L // window != 512, which is exactly what crashed:
+        # "expected... 2048... but got... 512" at the 16x16x16 stage).
+        # Using the real count instead of the fixed constant.
+        num_windows = L // window
 
         if W % 8 == 0:
             xtf = self.patchconv(x.flatten(2).unsqueeze(2))
@@ -425,10 +434,15 @@ class WSSM(nn.Module):
         out_y = self.selective_scan(
             xs, dts, As, Bs, Cs, Ds, z=None,
             delta_bias=dt_projs_bias, delta_softplus=True, return_last_state=False,
-        ).view(B, K, -1, n * n * n).contiguous()
+        )
+        # (original code reshaped to the hardcoded n*n*n here too, then
+        # reshaped AGAIN identically inside the `if` branch below -- that
+        # first reshape was redundant dead code even before this fix, since
+        # both branches immediately re-view out_y into their own target
+        # shape anyway. Removed rather than fixed twice.)
 
         if W % 8 == 0:
-            out_y = out_y.view(B, K, -1, n * n * n).contiguous()
+            out_y = out_y.view(B, K, -1, num_windows).contiguous()
             y1 = self.unpatchconv(out_y[:, 0, :, :]).view(B, -1, D, H, W)
             y2 = torch.roll(self.unpatchconv(out_y[:, 1, :, :]).view(B, -1, D, H, W), shifts=(0, 0, -int(W / 8 / 2)), dims=(2, 3, 4))
             y3 = self.unpatchconv(out_y[:, 2, :, :]).view(B, -1, D, H, W).transpose(3, 4).flip(dims=(3, 4))
