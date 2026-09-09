@@ -40,6 +40,8 @@ import torch
 import nibabel as nib
 from torch.utils.data import Dataset
 
+from src.data.augmentation import BraTSAugmentor
+
 MODALITY_SUFFIXES = ['_flair.nii.gz', '_t1.nii.gz', '_t1ce.nii.gz', '_t2.nii.gz']
 SEG_SUFFIX = '_seg.nii.gz'
 
@@ -130,12 +132,15 @@ class BratsDataset(Dataset):
                   so exactly which cases land in train/val/test is
                   reproducible and inspectable.
         crop_size: (H, W, D), defaults to the paper's 128x128x128
+        augment: apply BraTSAugmentor (see augmentation.py) when split=='train'.
+                 Has no effect for val/test regardless of this flag.
     """
 
-    def __init__(self, base_dir, split='train', case_ids=None, crop_size=(128, 128, 128)):
+    def __init__(self, base_dir, split='train', case_ids=None, crop_size=(128, 128, 128), augment=True):
         self.base_dir = base_dir
         self.split = split
         self.crop_size = crop_size
+        self.augmentor = BraTSAugmentor() if (augment and split == 'train') else None
         if case_ids is not None:
             self.case_ids = list(case_ids)
         else:
@@ -172,6 +177,8 @@ class BratsDataset(Dataset):
 
         if self.split == 'train':
             image, label = _random_crop(image, label, self.crop_size)
+            if self.augmentor is not None:
+                image, label = self.augmentor(image, label)
         else:
             image = _center_crop_or_pad(image, self.crop_size)
             label = _center_crop_or_pad(label, self.crop_size)

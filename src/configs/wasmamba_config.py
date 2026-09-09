@@ -77,12 +77,14 @@ class setting_config:
     val_split = 0.05
     test_split = 0.15
 
-    # TODO: (nnFormer, via WAS-Mamba's deferral) training augmentation is
+    # (nnFormer, via WAS-Mamba's deferral) training augmentation --
     # rotation, scaling, gaussian noise, gaussian blur, brightness/contrast,
     # low-resolution simulation, gamma, and mirroring, applied in that
-    # order. NOT implemented yet in src/data/brats_dataset.py (which
-    # currently only crops + z-score normalizes) — add before real training
-    # runs, not just the architecture smoke-test.
+    # order. Implemented 2026-09-09 in src/data/augmentation.py
+    # (BraTSAugmentor), wired into BratsDataset for split='train' only.
+    # Per-transform probabilities are nnU-Net's public defaults, not
+    # independently confirmed against nnFormer's own code -- see that
+    # file's docstring.
 
     pretrained_path = ''
     num_classes = model_config['num_classes']
