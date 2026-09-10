@@ -51,6 +51,10 @@ class setting_config:
         'depths_decoder': [1, 1, 1, 1],
         'drop_path_rate': 0.2,
         'load_ckpt_path': None,
+        # Gradient checkpointing -- ON because the paper's 48GB A6000 setup
+        # OOMs on a 16GB Colab T4. Recomputes activations in backward
+        # instead of storing them. Set False if training on >=24GB VRAM.
+        'use_checkpoint': True,
     }
 
     datasets_name = 'brats'
@@ -105,8 +109,11 @@ class setting_config:
     rank = None
     amp = False
 
-    # (nnFormer, via WAS-Mamba's deferral) Table I: batch_size = 2
-    batch_size = 2
+    # Paper / nnFormer use batch_size = 2 (on a 48GB A6000). Dropped to 1
+    # for the 16GB Colab T4 -- batch=2 OOMs even with gradient checkpointing
+    # on. This is a hardware-forced deviation, worth stating in the report;
+    # raise back to 2 if training on >=24GB VRAM.
+    batch_size = 1
 
     # (paper) "WAS-Mamba was trained for 1k epochs on a single NVIDIA RTX
     # A6000 GPU with 48GB of memory"

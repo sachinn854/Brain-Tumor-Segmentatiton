@@ -566,7 +566,10 @@ class WASLayer(nn.Module):
 
     def forward(self, x):
         for blk in self.blocks:
-            x = blk(x)
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -612,7 +615,7 @@ class WASLayer_up(nn.Module):
             x = self.upsample(x)
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
         return x
@@ -739,10 +742,16 @@ class WASMamba(nn.Module):
             depths_decoder=[2, 2, 2, 2],
             drop_path_rate=0.2,
             load_ckpt_path=None,
+            use_checkpoint=False,
     ):
         super().__init__()
         self.load_ckpt_path = load_ckpt_path
         self.num_classes = num_classes
+        # use_checkpoint=True turns on gradient (activation) checkpointing in
+        # every WASLayer / WASLayer_up: activations are recomputed during the
+        # backward pass instead of being kept in VRAM. ~30% slower, but on a
+        # 16GB T4 it's the difference between training and an OOM crash --
+        # the paper trained on a 48GB A6000 where this wasn't needed.
         self.wasmamba = VSSM(
             patch_size=(2, 2, 2),
             in_chans=input_channels,
@@ -750,6 +759,7 @@ class WASMamba(nn.Module):
             depths=depths,
             depths_decoder=depths_decoder,
             drop_path_rate=drop_path_rate,
+            use_checkpoint=use_checkpoint,
         )
 
     def forward(self, x):

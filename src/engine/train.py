@@ -25,6 +25,12 @@ paper's real 1000 epochs.
 """
 
 import os
+
+# Reduce CUDA memory fragmentation -- must be set before torch is imported.
+# On a 16GB T4 the difference between fitting and an OOM can be just the
+# fragmented-but-unallocated slack this reclaims.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import json
 import random
 import argparse
@@ -167,6 +173,7 @@ def main():
         depths=cfg.model_config['depths'],
         depths_decoder=cfg.model_config['depths_decoder'],
         drop_path_rate=cfg.model_config['drop_path_rate'],
+        use_checkpoint=cfg.model_config.get('use_checkpoint', False),
     ).to(device)
 
     optimizer = get_optimizer(cfg, model)
