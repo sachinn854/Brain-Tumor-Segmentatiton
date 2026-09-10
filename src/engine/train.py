@@ -36,8 +36,26 @@ from torch.utils.data import DataLoader
 from src.models.wasmamba import WASMamba
 from src.data.brats_dataset import BratsDataset
 from src.utils.train_utils import set_seed, get_optimizer, get_scheduler, get_logger, log_config_info
-from src.utils.metrics import calculate_metric_percase
 from src.configs.wasmamba_config import setting_config as config
+
+
+def _dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    """
+    Binary Dice for one class. Pure numpy -- deliberately NOT imported from
+    src/utils/metrics.py, which pulls in SimpleITK/matplotlib/medpy at
+    module load for its Synapse-specific 2D helpers (none of which are
+    installed on a stock Colab, and none of which training needs).
+
+    Convention when a class is absent from the ground truth: if the model
+    also predicted nothing for it, that's a perfect 1.0; if it predicted
+    something, that's 0.0.
+    """
+    pred_sum = pred_mask.sum()
+    gt_sum = gt_mask.sum()
+    if gt_sum == 0:
+        return 1.0 if pred_sum == 0 else 0.0
+    intersection = np.logical_and(pred_mask, gt_mask).sum()
+    return float(2.0 * intersection / (pred_sum + gt_sum))
 
 
 def make_splits(data_path, train_split, val_split, seed, splits_path):
@@ -96,10 +114,7 @@ def validate(model, val_loader, criterion, num_classes, device):
             pred = torch.argmax(torch.softmax(output, dim=1), dim=1).cpu().numpy()
             gt = label.cpu().numpy()
             for c in range(1, num_classes):
-                dice, _ = calculate_metric_percase(
-                    (pred == c).astype(np.uint8).copy(),
-                    (gt == c).astype(np.uint8).copy(),
-                )
+                dice = _dice_score(pred == c, gt == c)
                 dice_per_class[c - 1].append(dice)
 
     mean_loss = total_loss / max(len(val_loader), 1)
