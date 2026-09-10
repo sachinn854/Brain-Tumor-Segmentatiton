@@ -1,0 +1,18 @@
+# WAS-Mamba on BraTS -- local training dependencies.
+#
+# Install torch FIRST, matched to your CUDA version, from pytorch.org --
+# it's intentionally not pinned here. Then:  pip install -r requirements.txt
+#
+# mamba-ssm and causal-conv1d compile CUDA extensions at install time and
+# need a matching CUDA toolkit + nvcc on PATH. On Windows they are not
+# reliably installable natively -- use WSL2 or a Linux box. If pip's
+# default isolated build fails to see your installed torch, add:
+#     pip install causal-conv1d mamba-ssm --no-build-isolation
+
+einops
+timm
+nibabel
+scipy
+numpy
+causal-conv1d>=1.4.0
+mamba-ssm

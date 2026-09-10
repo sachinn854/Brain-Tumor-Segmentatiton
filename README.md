@@ -13,8 +13,8 @@ Approach: replicate an IEEE Transactions (2024+) base model exactly, then add an
 
 - Guide approval: pending
 - Contribution idea: not finalized yet
-- Base-model code scaffold: done (`src/`) — architecture, loss, BraTS data loader, and hyperparameters cross-checked against the paper (see file-level comments in `src/configs/wasmamba_config.py` for exactly what's paper-confirmed vs. inferred)
-- Not yet done: real training run (blocked on GPU access beyond local dev/debug — see that config file's comments), data augmentation pipeline
+- Base-model scaffold: done — architecture, loss, BraTS data loader, augmentation, and a full training loop. Model + loss + data loader verified end-to-end on a real BraTS case.
+- Training runs **locally** (not Colab — the free T4's 16GB VRAM can't hold this 3D model's training activations even at batch size 1).
 
 ---
 
@@ -22,23 +22,65 @@ Approach: replicate an IEEE Transactions (2024+) base model exactly, then add an
 
 ```
 src/
-├── models/wasmamba.py       WAS-Mamba architecture
-├── losses/losses.py         Loss functions, incl. the paper's Dice+CE loss
-├── data/brats_dataset.py    BraTS PyTorch Dataset (written from scratch —
-│                             not part of the paper's public code release)
-├── utils/                   Training utilities (seed, optimizer, scheduler,
-│                             logging) and evaluation metrics
-└── configs/wasmamba_config.py  Training config, hyperparameters
+├── models/wasmamba.py            WAS-Mamba architecture (copied from the authors'
+│                                 repo + 4 bug fixes to make their own code run)
+├── losses/losses.py              Loss functions, incl. the paper's Dice+CE loss
+├── data/
+│   ├── brats_dataset.py          BraTS PyTorch Dataset (written from scratch —
+│   │                             the paper's public code has no BraTS loader)
+│   └── augmentation.py           nnFormer's training augmentation pipeline
+├── engine/train.py               Training loop — split, checkpointing, resume, validation
+├── utils/                        seed, optimizer, scheduler, logging
+└── configs/wasmamba_config.py    All hyperparameters, each annotated with its source
 ```
 
 Planning notes, downloaded papers, and the literature review are kept locally only (not pushed here).
 
 ---
 
-## Setup
+## Setup (local, Linux or WSL2)
+
+Install PyTorch first, matched to your CUDA version (see pytorch.org). Then:
 
 ```bash
-pip install torch einops timm mamba-ssm causal-conv1d
+pip install -r requirements.txt
 ```
 
-`mamba-ssm`'s CUDA kernels are Linux-targeted; on Windows, use WSL2 or run on Colab/a Linux GPU box.
+`mamba-ssm` / `causal-conv1d` compile CUDA extensions and need `nvcc` on PATH.
+On Windows they don't install reliably — use WSL2 or a Linux machine.
+If the isolated build can't see your torch: `pip install causal-conv1d mamba-ssm --no-build-isolation`
+
+---
+
+## Data
+
+Put BraTS cases under `data/BraTS2021/` (gitignored), one folder per case:
+
+```
+data/BraTS2021/
+├── BraTS2021_00000/
+│   ├── BraTS2021_00000_flair.nii.gz
+│   ├── BraTS2021_00000_t1.nii.gz
+│   ├── BraTS2021_00000_t1ce.nii.gz
+│   ├── BraTS2021_00000_t2.nii.gz
+│   └── BraTS2021_00000_seg.nii.gz
+├── BraTS2021_00002/
+│   └── ...
+```
+
+The official BraTS2021 training archive already has this layout.
+
+---
+
+## Train
+
+```bash
+python -m src.engine.train --epochs 2       # quick end-to-end check first
+python -m src.engine.train                  # real run (1000 epochs, per the paper)
+```
+
+Config defaults (`batch_size=1`, gradient checkpointing on) are tuned for ~16GB VRAM.
+On a ≥24GB GPU, match the paper's setup: `--batch_size 2 --no_checkpoint`.
+
+Checkpoints go to `results/checkpoints/`. Training auto-resumes from `latest.pth` there,
+so an interrupted run just needs the same command again.

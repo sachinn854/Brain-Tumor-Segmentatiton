@@ -1,5 +1,5 @@
 """
-Training loop for WAS-Mamba base model on BraTS.
+Training loop for WAS-Mamba base model on BraTS -- local training.
 
 Written from scratch this session -- the original repo's own training
 script (`test.py` in their GitHub release) imports `datasets.dataset`,
@@ -7,21 +7,27 @@ script (`test.py` in their GitHub release) imports `datasets.dataset`,
 in the repo, so it never actually ran even for the authors' own Synapse
 setup. There was nothing usable to port for BraTS specifically.
 
-Usage (run from the repo root, e.g. inside a Colab cell after `%cd`):
-    python -m src.engine.train \\
-        --data_path /content/drive/MyDrive/BraTS2021/train \\
-        --checkpoint_dir /content/drive/MyDrive/wasmamba_checkpoints
+Data layout expected under --data_path (default: ./data/BraTS2021):
+    <data_path>/<case_id>/<case_id>_flair.nii.gz
+    <data_path>/<case_id>/<case_id>_t1.nii.gz
+    <data_path>/<case_id>/<case_id>_t1ce.nii.gz
+    <data_path>/<case_id>/<case_id>_t2.nii.gz
+    <data_path>/<case_id>/<case_id>_seg.nii.gz
+i.e. one folder per case, each holding that case's 4 modalities + mask.
+The official BraTS2021 training archive already has this structure; if
+yours is flat, wrap each case's files in a `<case_id>/` folder first.
 
-IMPORTANT: put --checkpoint_dir on Google Drive (a mounted path under
-/content/drive/...), not under /content/ directly -- Colab's local disk is
-wiped when the session ends or disconnects, so a checkpoint saved only
-there is lost. This script resumes automatically from `latest.pth` in
---checkpoint_dir if it exists, which is what makes training survive
-Colab's ~12h session limit across multiple runs.
+Usage (run from the repo root):
+    python -m src.engine.train                          # uses all defaults
+    python -m src.engine.train --epochs 2               # quick end-to-end check first
+    python -m src.engine.train --batch_size 2 --no_checkpoint   # if you have >=24GB VRAM
 
---epochs lets you override config.epochs for a quick short run (e.g.
-`--epochs 2`) to confirm the whole loop works before committing to the
-paper's real 1000 epochs.
+Resumes automatically from `latest.pth` in --checkpoint_dir if it exists,
+so an interrupted run just needs the same command again to continue.
+
+Defaults (batch_size=1, gradient checkpointing on) come from
+src/configs/wasmamba_config.py and are tuned for a ~16GB GPU. On a bigger
+card, pass --batch_size 2 --no_checkpoint to match the paper's setup.
 """
 
 import os
@@ -130,24 +136,41 @@ def validate(model, val_loader, criterion, num_classes, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, required=True,
-                         help='Folder containing one subfolder per BraTS case')
-    parser.add_argument('--checkpoint_dir', type=str, required=True,
-                         help='Where to save/resume checkpoints -- put this on Drive, not /content')
+    parser.add_argument('--data_path', type=str, default='data/BraTS2021',
+                         help='Folder containing one subfolder per BraTS case (default: data/BraTS2021)')
+    parser.add_argument('--checkpoint_dir', type=str, default='results/checkpoints',
+                         help='Where to save/resume checkpoints (default: results/checkpoints)')
     parser.add_argument('--splits_path', type=str, default=None,
                          help='Where to save/load the train/val/test case-ID split (default: <checkpoint_dir>/splits.json)')
     parser.add_argument('--epochs', type=int, default=None,
                          help='Override config.epochs, e.g. --epochs 2 for a quick end-to-end smoke run')
+    parser.add_argument('--batch_size', type=int, default=None,
+                         help='Override config.batch_size (config default is 1, tuned for ~16GB VRAM)')
+    parser.add_argument('--no_checkpoint', action='store_true',
+                         help='Disable gradient checkpointing (faster, but needs more VRAM -- only if you have >=24GB)')
     args = parser.parse_args()
 
     cfg = config
     if args.epochs is not None:
         cfg.epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.no_checkpoint:
+        cfg.model_config['use_checkpoint'] = False
+
+    if not os.path.isdir(args.data_path):
+        raise SystemExit(
+            f"data_path '{args.data_path}' not found. Put BraTS cases there as "
+            f"<data_path>/<case_id>/<case_id>_flair.nii.gz (+ _t1/_t1ce/_t2/_seg), "
+            f"or pass --data_path pointing at your data folder."
+        )
 
     splits_path = args.splits_path or os.path.join(args.checkpoint_dir, 'splits.json')
 
     set_seed(cfg.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        print("WARNING: no CUDA GPU detected -- training on CPU will be impractically slow.")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     logger = get_logger('train', os.path.join(args.checkpoint_dir, 'log'))
