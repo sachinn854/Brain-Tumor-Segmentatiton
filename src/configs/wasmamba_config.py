@@ -103,7 +103,16 @@ class setting_config:
 
     distributed = False
     local_rank = -1
-    num_workers = 0
+    # 0 (repo's original default) means single-threaded data loading --
+    # the CPU-bound augmentation pipeline (scipy rotate/zoom/gaussian_filter,
+    # see src/data/augmentation.py) then runs serially before every GPU
+    # step instead of overlapping with it. Measured ~12s/step on Kaggle
+    # with num_workers=0; raising this lets the DataLoader prefetch the
+    # next batch(es) on CPU while the GPU is busy with the current one.
+    # 2-4 is a reasonable default for a typical 4-core Kaggle/Colab CPU
+    # allocation (leave at least one core free); tune based on what
+    # nvidia-smi/CPU usage actually looks like once running.
+    num_workers = 4
     seed = 42
     world_size = None
     rank = None

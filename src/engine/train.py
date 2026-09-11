@@ -177,6 +177,8 @@ def main():
                          help='Override config.batch_size (config default is 1, tuned for ~16GB VRAM)')
     parser.add_argument('--no_checkpoint', action='store_true',
                          help='Disable gradient checkpointing (faster, but needs more VRAM -- only if you have >=24GB)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                         help='Override config.num_workers (default 4) -- parallel CPU data-loading processes')
     args = parser.parse_args()
 
     cfg = config
@@ -186,6 +188,8 @@ def main():
         cfg.batch_size = args.batch_size
     if args.no_checkpoint:
         cfg.model_config['use_checkpoint'] = False
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
 
     if not os.path.isdir(args.data_path):
         raise SystemExit(
