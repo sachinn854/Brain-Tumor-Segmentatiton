@@ -139,7 +139,7 @@ def _hd95_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     return float(np.percentile(all_dists, 95))
 
 
-def make_splits(data_path, train_split, val_split, seed, splits_path):
+def make_splits(data_path, train_split, val_split, seed, splits_path, max_train_cases=None):
     """
     Reproducible 80:5:15 (paper's ratios) train/val/test case-ID split.
 
@@ -147,6 +147,12 @@ def make_splits(data_path, train_split, val_split, seed, splits_path):
     which cases land in which split is fixed and inspectable -- not
     re-randomized on every run (which would silently leak "test" cases into
     training across restarts).
+
+    max_train_cases: if set, truncates ONLY the train list to this many
+    cases (val/test keep their full, paper-ratio sizes -- so evaluation
+    stays representative of the whole dataset even when training is capped
+    for speed). This is a compute-budget compromise, not part of the paper;
+    state the actual number used in the report.
     """
     if os.path.exists(splits_path):
         with open(splits_path) as f:
@@ -163,8 +169,12 @@ def make_splits(data_path, train_split, val_split, seed, splits_path):
     n_train = int(n * train_split)
     n_val = int(n * val_split)
 
+    train_ids = case_ids[:n_train]
+    if max_train_cases is not None:
+        train_ids = train_ids[:max_train_cases]
+
     splits = {
-        'train': case_ids[:n_train],
+        'train': train_ids,
         'val': case_ids[n_train:n_train + n_val],
         'test': case_ids[n_train + n_val:],
     }
@@ -239,6 +249,10 @@ def main():
                          help='Disable gradient checkpointing (faster, but needs more VRAM -- only if you have >=24GB)')
     parser.add_argument('--num_workers', type=int, default=None,
                          help='Override config.num_workers (default 4) -- parallel CPU data-loading processes')
+    parser.add_argument('--max_train_cases', type=int, default=None,
+                         help='Cap the number of training cases (val/test stay full-size) -- a speed/compute-budget '
+                              'compromise, not from the paper. E.g. --max_train_cases 250 cuts epoch time ~4x '
+                              'vs the full ~1000-case train split. State the number actually used in the report.')
     args = parser.parse_args()
 
     cfg = config
@@ -269,7 +283,8 @@ def main():
     logger = get_logger('train', os.path.join(args.checkpoint_dir, 'log'))
     log_config_info(cfg, logger)
 
-    splits = make_splits(args.data_path, cfg.train_split, cfg.val_split, cfg.seed, splits_path)
+    splits = make_splits(args.data_path, cfg.train_split, cfg.val_split, cfg.seed, splits_path,
+                          max_train_cases=args.max_train_cases)
     split_msg = f"Split sizes -- train: {len(splits['train'])}, val: {len(splits['val'])}, test: {len(splits['test'])}"
     print(split_msg)
     logger.info(split_msg)
