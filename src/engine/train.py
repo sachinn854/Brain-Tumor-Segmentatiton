@@ -28,6 +28,14 @@ so an interrupted run just needs the same command again to continue.
 Defaults (batch_size=1, gradient checkpointing on) come from
 src/configs/wasmamba_config.py and are tuned for a ~16GB GPU. On a bigger
 card, pass --batch_size 2 --no_checkpoint to match the paper's setup.
+
+Logging: a tqdm progress bar shows live loss per step. Every
+config.print_interval steps and at the end of every epoch, both train and
+val report is broken into CE and Dice components separately (not just the
+combined loss actually used for backward) and Dice per class by name
+(background is never reported, only the 3 foreground classes -- see
+CLASS_NAMES, matching the label remapping in brats_dataset.py). Everything
+printed also goes to <checkpoint_dir>/log/train.info.log.
 """
 
 import os
@@ -40,15 +48,26 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import json
 import random
 import argparse
+import time
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.models.wasmamba import WASMamba
 from src.data.brats_dataset import BratsDataset
 from src.utils.train_utils import set_seed, get_optimizer, get_scheduler, get_logger, log_config_info
 from src.configs.wasmamba_config import setting_config as config
+
+# Matches RAW_LABEL_TO_CLASS in src/data/brats_dataset.py (0=background is
+# never reported per-class below, only the 3 foreground classes are).
+CLASS_NAMES = ['background', 'non_enhancing_tumor_core', 'edema', 'enhancing_tumor']
+
+
+def _format_per_class(values):
+    """[0.12, 0.5, 0.8] -> 'non_enhancing_tumor_core: 0.1200, edema: 0.5000, enhancing_tumor: 0.8000'"""
+    return ', '.join(f'{CLASS_NAMES[c + 1]}: {v:.4f}' for c, v in enumerate(values))
 
 
 def _dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
@@ -105,23 +124,30 @@ def make_splits(data_path, train_split, val_split, seed, splits_path):
     return splits
 
 
-def validate(model, val_loader, criterion, num_classes, device):
+def validate(model, val_loader, criterion, num_classes, device, verbose=True):
     """
-    Per-class Dice on the val split. Unlike src/utils/metrics.py's
-    `test_single_volume` (which is Synapse's 2D-slice-based evaluation),
-    this operates directly on the 3D volumes BratsDataset returns --
-    written fresh for BraTS rather than reusing that function.
+    Per-class Dice + CE/Dice loss breakdown on the val split. Unlike
+    src/utils/metrics.py's `test_single_volume` (which is Synapse's
+    2D-slice-based evaluation), this operates directly on the 3D volumes
+    BratsDataset returns -- written fresh for BraTS rather than reusing
+    that function.
     """
     model.eval()
-    total_loss = 0.0
+    total_loss, total_ce, total_dice_loss = 0.0, 0.0, 0.0
     dice_per_class = [[] for _ in range(1, num_classes)]
+
+    iterator = tqdm(val_loader, desc='  validating', leave=False, disable=not verbose)
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in iterator:
             image = batch['image'].to(device)
             label = batch['label'].to(device)
             output = model(image)
             loss = criterion(output, label)
             total_loss += loss.item()
+            # criterion (PaperDiceCeLoss) stores its two components as
+            # sub-modules -- reused here for the breakdown, not re-derived.
+            total_ce += criterion.celoss(output, label.long()).item()
+            total_dice_loss += criterion.diceloss(output, label, softmax=True).item()
 
             pred = torch.argmax(torch.softmax(output, dim=1), dim=1).cpu().numpy()
             gt = label.cpu().numpy()
@@ -129,9 +155,12 @@ def validate(model, val_loader, criterion, num_classes, device):
                 dice = _dice_score(pred == c, gt == c)
                 dice_per_class[c - 1].append(dice)
 
-    mean_loss = total_loss / max(len(val_loader), 1)
+    n = max(len(val_loader), 1)
+    mean_loss = total_loss / n
+    mean_ce = total_ce / n
+    mean_dice_loss = total_dice_loss / n
     mean_dice_per_class = [float(np.mean(d)) if d else 0.0 for d in dice_per_class]
-    return mean_loss, mean_dice_per_class
+    return mean_loss, mean_ce, mean_dice_loss, mean_dice_per_class
 
 
 def main():
@@ -219,10 +248,18 @@ def main():
         print(resume_msg)
         logger.info(resume_msg)
 
+    print(f"Class order for all per-class metrics below: {CLASS_NAMES[1:]}")
+    logger.info(f"Class order for all per-class metrics below: {CLASS_NAMES[1:]}")
+
     for epoch in range(start_epoch, cfg.epochs + 1):
+        epoch_start = time.time()
         model.train()
-        epoch_loss = 0.0
-        for step, batch in enumerate(train_loader):
+        epoch_loss, epoch_ce, epoch_dice_loss = 0.0, 0.0, 0.0
+        train_dice_per_class = [[] for _ in range(1, cfg.num_classes)]
+
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"Epoch {epoch}/{cfg.epochs}", unit="step")
+        for step, batch in pbar:
             image = batch['image'].to(device)
             label = batch['label'].to(device)
 
@@ -232,18 +269,50 @@ def main():
             loss.backward()
             optimizer.step()
 
+            # Component breakdown for logging only -- criterion's own
+            # forward already computed the combined loss used for backward;
+            # this re-runs its two sub-losses to report them separately.
+            with torch.no_grad():
+                ce_val = criterion.celoss(output, label.long()).item()
+                dice_val = criterion.diceloss(output, label, softmax=True).item()
+
             epoch_loss += loss.item()
+            epoch_ce += ce_val
+            epoch_dice_loss += dice_val
+
+            # Live per-class train Dice on this batch (cheap, same output
+            # tensor already computed above -- not a full separate pass).
+            with torch.no_grad():
+                pred = torch.argmax(torch.softmax(output, dim=1), dim=1).cpu().numpy()
+                gt = label.cpu().numpy()
+                batch_dice = []
+                for c in range(1, cfg.num_classes):
+                    d = _dice_score(pred == c, gt == c)
+                    train_dice_per_class[c - 1].append(d)
+                    batch_dice.append(d)
+
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'ce': f'{ce_val:.4f}',
+                'dice_loss': f'{dice_val:.4f}',
+            })
+
             if step % cfg.print_interval == 0:
-                msg = f"Epoch {epoch}/{cfg.epochs} Step {step}/{len(train_loader)} Loss {loss.item():.4f}"
-                print(msg)
-                logger.info(msg)
+                msg = (f"Epoch {epoch}/{cfg.epochs} Step {step}/{len(train_loader)} "
+                       f"loss {loss.item():.4f} (ce {ce_val:.4f} + dice_loss {dice_val:.4f}) "
+                       f"| train_dice this batch -- {_format_per_class(batch_dice)}")
+                logger.info(msg)  # goes to the log file; tqdm's bar already shows this on screen
 
         scheduler.step()
-        mean_train_loss = epoch_loss / max(len(train_loader), 1)
+        n_steps = max(len(train_loader), 1)
+        mean_train_loss = epoch_loss / n_steps
+        mean_train_ce = epoch_ce / n_steps
+        mean_train_dice_loss = epoch_dice_loss / n_steps
+        mean_train_dice_per_class = [float(np.mean(d)) if d else 0.0 for d in train_dice_per_class]
 
-        # Save every epoch, not just periodically -- Colab can disconnect at
-        # any time, and re-doing a whole epoch on a T4 is far more expensive
-        # than the few seconds this write costs.
+        # Save every epoch, not just periodically -- Colab/Kaggle can
+        # disconnect at any time, and re-doing a whole epoch is far more
+        # expensive than the few seconds this write costs.
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -252,18 +321,35 @@ def main():
             'best_val_dice': best_val_dice,
         }, latest_ckpt_path)
 
+        epoch_time = time.time() - epoch_start
+        eta_hours = epoch_time * (cfg.epochs - epoch) / 3600
+
+        summary = (
+            f"\n===== Epoch {epoch}/{cfg.epochs} summary "
+            f"({epoch_time:.1f}s, ETA {eta_hours:.1f}h for remaining epochs) =====\n"
+            f"  train_loss      : {mean_train_loss:.4f}  (ce {mean_train_ce:.4f} + dice_loss {mean_train_dice_loss:.4f})\n"
+            f"  train_dice/class: {_format_per_class(mean_train_dice_per_class)}\n"
+            f"  train_mean_dice : {float(np.mean(mean_train_dice_per_class)):.4f}\n"
+        )
+
         if epoch % cfg.val_interval == 0:
-            val_loss, dice_per_class = validate(model, val_loader, criterion, cfg.num_classes, device)
+            val_loss, val_ce, val_dice_loss, dice_per_class = validate(
+                model, val_loader, criterion, cfg.num_classes, device
+            )
             mean_dice = float(np.mean(dice_per_class))
-            msg = (f"Epoch {epoch} -- train_loss {mean_train_loss:.4f} val_loss {val_loss:.4f} "
-                   f"val_dice_per_class {dice_per_class} mean_dice {mean_dice:.4f}")
-            print(msg)
-            logger.info(msg)
+            summary += (
+                f"  val_loss        : {val_loss:.4f}  (ce {val_ce:.4f} + dice_loss {val_dice_loss:.4f})\n"
+                f"  val_dice/class  : {_format_per_class(dice_per_class)}\n"
+                f"  val_mean_dice   : {mean_dice:.4f}\n"
+            )
 
             if mean_dice > best_val_dice:
                 best_val_dice = mean_dice
                 torch.save(model.state_dict(), best_ckpt_path)
-                logger.info(f"New best mean dice {best_val_dice:.4f} -- saved {best_ckpt_path}")
+                summary += f"  -> New best mean dice {best_val_dice:.4f} -- saved {best_ckpt_path}\n"
+
+        print(summary)
+        logger.info(summary)
 
 
 if __name__ == '__main__':

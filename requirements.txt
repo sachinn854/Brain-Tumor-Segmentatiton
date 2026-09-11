@@ -14,5 +14,6 @@ timm
 nibabel
 scipy
 numpy
+tqdm
 causal-conv1d>=1.4.0
 mamba-ssm
