@@ -139,20 +139,17 @@ def _hd95_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     return float(np.percentile(all_dists, 95))
 
 
-def make_splits(data_path, train_split, val_split, seed, splits_path, max_train_cases=None):
+def make_splits(data_path, train_split, val_split, seed, splits_path):
     """
     Reproducible 80:5:15 (paper's ratios) train/val/test case-ID split.
 
     Written once to `splits_path` and reused on every later call/resume, so
     which cases land in which split is fixed and inspectable -- not
     re-randomized on every run (which would silently leak "test" cases into
-    training across restarts).
-
-    max_train_cases: if set, truncates ONLY the train list to this many
-    cases (val/test keep their full, paper-ratio sizes -- so evaluation
-    stays representative of the whole dataset even when training is capped
-    for speed). This is a compute-budget compromise, not part of the paper;
-    state the actual number used in the report.
+    training across restarts). Always the FULL split -- if you want to cap
+    training-set size for speed, that's --max_train_cases (see main()),
+    which rotates through this full train list across epochs rather than
+    permanently excluding cases.
     """
     if os.path.exists(splits_path):
         with open(splits_path) as f:
@@ -169,12 +166,8 @@ def make_splits(data_path, train_split, val_split, seed, splits_path, max_train_
     n_train = int(n * train_split)
     n_val = int(n * val_split)
 
-    train_ids = case_ids[:n_train]
-    if max_train_cases is not None:
-        train_ids = train_ids[:max_train_cases]
-
     splits = {
-        'train': train_ids,
+        'train': case_ids[:n_train],
         'val': case_ids[n_train:n_train + n_val],
         'test': case_ids[n_train + n_val:],
     }
@@ -182,6 +175,29 @@ def make_splits(data_path, train_split, val_split, seed, splits_path, max_train_
     with open(splits_path, 'w') as f:
         json.dump(splits, f, indent=2)
     return splits
+
+
+def _epoch_train_subset(full_train_ids, max_train_cases, epoch):
+    """
+    Which cases to train on THIS epoch, when --max_train_cases caps the
+    per-epoch training-set size. Rotates through full_train_ids in
+    non-overlapping chunks (wrapping around) rather than permanently
+    picking one fixed subset -- e.g. with 1000 total cases and
+    max_train_cases=250, epoch 1 uses cases 0-249, epoch 2 uses 250-499,
+    epoch 3 uses 500-749, epoch 4 uses 750-999, epoch 5 wraps back to
+    0-249, etc. Over ~4 epochs the model sees all 1000 cases once, while
+    each individual epoch only costs 250 cases' worth of compute.
+    """
+    if max_train_cases is None or max_train_cases >= len(full_train_ids):
+        return full_train_ids
+
+    n = len(full_train_ids)
+    k = max_train_cases
+    start = ((epoch - 1) * k) % n
+    end = start + k
+    if end <= n:
+        return full_train_ids[start:end]
+    return full_train_ids[start:] + full_train_ids[:end - n]
 
 
 def validate(model, val_loader, criterion, num_classes, device, verbose=True):
@@ -250,9 +266,12 @@ def main():
     parser.add_argument('--num_workers', type=int, default=None,
                          help='Override config.num_workers (default 4) -- parallel CPU data-loading processes')
     parser.add_argument('--max_train_cases', type=int, default=None,
-                         help='Cap the number of training cases (val/test stay full-size) -- a speed/compute-budget '
-                              'compromise, not from the paper. E.g. --max_train_cases 250 cuts epoch time ~4x '
-                              'vs the full ~1000-case train split. State the number actually used in the report.')
+                         help='Cap cases USED PER EPOCH (val/test stay full-size); rotates through the full train '
+                              'list across epochs rather than permanently dropping cases, so the whole train set '
+                              'still gets seen over time -- see _epoch_train_subset(). A speed/compute-budget '
+                              'compromise, not from the paper. E.g. --max_train_cases 250 cuts epoch time ~4x vs '
+                              'the full ~1000-case train split (full list covered once every ~4 epochs). State '
+                              'the number actually used in the report.')
     args = parser.parse_args()
 
     cfg = config
@@ -283,18 +302,20 @@ def main():
     logger = get_logger('train', os.path.join(args.checkpoint_dir, 'log'))
     log_config_info(cfg, logger)
 
-    splits = make_splits(args.data_path, cfg.train_split, cfg.val_split, cfg.seed, splits_path,
-                          max_train_cases=args.max_train_cases)
-    split_msg = f"Split sizes -- train: {len(splits['train'])}, val: {len(splits['val'])}, test: {len(splits['test'])}"
+    splits = make_splits(args.data_path, cfg.train_split, cfg.val_split, cfg.seed, splits_path)
+    split_msg = f"Split sizes -- train (full): {len(splits['train'])}, val: {len(splits['val'])}, test: {len(splits['test'])}"
     print(split_msg)
     logger.info(split_msg)
+    if args.max_train_cases is not None and args.max_train_cases < len(splits['train']):
+        n_epochs_per_cycle = -(-len(splits['train']) // args.max_train_cases)  # ceil
+        rotate_msg = (f"--max_train_cases {args.max_train_cases}: each epoch uses a rotating "
+                       f"{args.max_train_cases}-case subset, full train list covered once every "
+                       f"{n_epochs_per_cycle} epochs")
+        print(rotate_msg)
+        logger.info(rotate_msg)
 
     crop_size = (cfg.input_size_h, cfg.input_size_w, cfg.input_size_c)
-    train_dataset = BratsDataset(args.data_path, split='train', case_ids=splits['train'], crop_size=crop_size)
     val_dataset = BratsDataset(args.data_path, split='val', case_ids=splits['val'], crop_size=crop_size, augment=False)
-
-    train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True,
-                               num_workers=cfg.num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False,
                              num_workers=cfg.num_workers, pin_memory=True)
 
@@ -335,6 +356,15 @@ def main():
         model.train()
         epoch_loss, epoch_ce, epoch_dice_loss = 0.0, 0.0, 0.0
         train_dice_per_class = [[] for _ in range(1, cfg.num_classes)]
+
+        # Rebuilt every epoch: with --max_train_cases this rotates to a
+        # different chunk of the full train list each time (see
+        # _epoch_train_subset); without it, this is just the full list
+        # again each epoch, at the DataLoader-construction cost of doing so.
+        epoch_train_ids = _epoch_train_subset(splits['train'], args.max_train_cases, epoch)
+        train_dataset = BratsDataset(args.data_path, split='train', case_ids=epoch_train_ids, crop_size=crop_size)
+        train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True,
+                                   num_workers=cfg.num_workers, pin_memory=True)
 
         pbar = tqdm(enumerate(train_loader), total=len(train_loader),
                     desc=f"Epoch {epoch}/{cfg.epochs}", unit="step")
