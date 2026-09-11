@@ -29,13 +29,19 @@ Defaults (batch_size=1, gradient checkpointing on) come from
 src/configs/wasmamba_config.py and are tuned for a ~16GB GPU. On a bigger
 card, pass --batch_size 2 --no_checkpoint to match the paper's setup.
 
-Logging: a tqdm progress bar shows live loss per step. Every
+Logging: a tqdm progress bar shows live loss + Dice score per step (not
+just dice_loss=1-Dice, the actual overlap metric too). Every
 config.print_interval steps and at the end of every epoch, both train and
-val report is broken into CE and Dice components separately (not just the
-combined loss actually used for backward) and Dice per class by name
+val report is broken into CE and Dice loss components separately (not just
+the combined loss actually used for backward) and Dice per class by name
 (background is never reported, only the 3 foreground classes -- see
-CLASS_NAMES, matching the label remapping in brats_dataset.py). Everything
-printed also goes to <checkpoint_dir>/log/train.info.log.
+CLASS_NAMES, matching the label remapping in brats_dataset.py). HD95 (95th
+percentile Hausdorff Distance, in voxels) is also reported per class, but
+only at validation, once per epoch -- not every training step, since
+distance transforms per class would meaningfully slow down all 1000
+training steps/epoch for a metric that's only really meaningful at
+val/test time anyway (matches how Table V in the paper reports it).
+Everything printed also goes to <checkpoint_dir>/log/train.info.log.
 """
 
 import os
@@ -54,6 +60,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from scipy.ndimage import distance_transform_edt, binary_erosion
 
 from src.models.wasmamba import WASMamba
 from src.data.brats_dataset import BratsDataset
@@ -66,8 +73,13 @@ CLASS_NAMES = ['background', 'non_enhancing_tumor_core', 'edema', 'enhancing_tum
 
 
 def _format_per_class(values):
-    """[0.12, 0.5, 0.8] -> 'non_enhancing_tumor_core: 0.1200, edema: 0.5000, enhancing_tumor: 0.8000'"""
-    return ', '.join(f'{CLASS_NAMES[c + 1]}: {v:.4f}' for c, v in enumerate(values))
+    """[0.12, 0.5, 0.8] -> 'non_enhancing_tumor_core: 0.1200, edema: 0.5000, enhancing_tumor: 0.8000'
+    NaN (e.g. a class with no ground-truth voxels this epoch, see
+    _hd95_score) prints as 'n/a' rather than a misleading number."""
+    return ', '.join(
+        f'{CLASS_NAMES[c + 1]}: {"n/a" if np.isnan(v) else f"{v:.4f}"}'
+        for c, v in enumerate(values)
+    )
 
 
 def _dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
@@ -87,6 +99,44 @@ def _dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
         return 1.0 if pred_sum == 0 else 0.0
     intersection = np.logical_and(pred_mask, gt_mask).sum()
     return float(2.0 * intersection / (pred_sum + gt_sum))
+
+
+def _hd95_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    """
+    95th-percentile Hausdorff Distance for one class, in voxels. Pure
+    scipy (distance_transform_edt + binary_erosion) -- same reasoning as
+    _dice_score above, no medpy/SimpleITK dependency needed.
+
+    Only meaningful (and only computed) at VALIDATION time, not every
+    training step -- distance transforms are cheap for one volume but not
+    cheap enough to add to every one of 1000 training steps/epoch without
+    undoing the num_workers speed fix. See validate() below.
+
+    Returns NaN when the ground truth has no voxels of this class (HD95
+    is undefined without a GT surface to measure against) -- callers
+    should use np.nanmean when averaging across cases/classes so those
+    don't silently count as 0.
+    """
+    pred_sum = pred_mask.sum()
+    gt_sum = gt_mask.sum()
+    if gt_sum == 0:
+        return 0.0 if pred_sum == 0 else float('nan')
+    if pred_sum == 0:
+        return float('nan')
+
+    pred_border = pred_mask ^ binary_erosion(pred_mask)
+    gt_border = gt_mask ^ binary_erosion(gt_mask)
+
+    dt_gt = distance_transform_edt(~gt_border)
+    dt_pred = distance_transform_edt(~pred_border)
+
+    dists_pred_to_gt = dt_gt[pred_border]
+    dists_gt_to_pred = dt_pred[gt_border]
+    all_dists = np.concatenate([dists_pred_to_gt, dists_gt_to_pred])
+
+    if all_dists.size == 0:
+        return 0.0
+    return float(np.percentile(all_dists, 95))
 
 
 def make_splits(data_path, train_split, val_split, seed, splits_path):
@@ -126,15 +176,21 @@ def make_splits(data_path, train_split, val_split, seed, splits_path):
 
 def validate(model, val_loader, criterion, num_classes, device, verbose=True):
     """
-    Per-class Dice + CE/Dice loss breakdown on the val split. Unlike
+    Per-class Dice + HD95 + CE/Dice loss breakdown on the val split. Unlike
     src/utils/metrics.py's `test_single_volume` (which is Synapse's
     2D-slice-based evaluation), this operates directly on the 3D volumes
     BratsDataset returns -- written fresh for BraTS rather than reusing
     that function.
+
+    HD95 is computed here (not in the training loop) deliberately --
+    distance transforms per class per case are cheap once per epoch over
+    ~5% of cases, but would meaningfully slow down every one of 1000
+    training steps/epoch if computed there too.
     """
     model.eval()
     total_loss, total_ce, total_dice_loss = 0.0, 0.0, 0.0
     dice_per_class = [[] for _ in range(1, num_classes)]
+    hd95_per_class = [[] for _ in range(1, num_classes)]
 
     iterator = tqdm(val_loader, desc='  validating', leave=False, disable=not verbose)
     with torch.no_grad():
@@ -152,15 +208,19 @@ def validate(model, val_loader, criterion, num_classes, device, verbose=True):
             pred = torch.argmax(torch.softmax(output, dim=1), dim=1).cpu().numpy()
             gt = label.cpu().numpy()
             for c in range(1, num_classes):
-                dice = _dice_score(pred == c, gt == c)
-                dice_per_class[c - 1].append(dice)
+                pred_c, gt_c = (pred == c), (gt == c)
+                dice_per_class[c - 1].append(_dice_score(pred_c, gt_c))
+                hd95_per_class[c - 1].append(_hd95_score(pred_c, gt_c))
 
     n = max(len(val_loader), 1)
     mean_loss = total_loss / n
     mean_ce = total_ce / n
     mean_dice_loss = total_dice_loss / n
     mean_dice_per_class = [float(np.mean(d)) if d else 0.0 for d in dice_per_class]
-    return mean_loss, mean_ce, mean_dice_loss, mean_dice_per_class
+    # nanmean: a case where this class had no GT voxels contributes NaN
+    # (see _hd95_score docstring) and should be excluded, not counted as 0.
+    mean_hd95_per_class = [float(np.nanmean(h)) if h else float('nan') for h in hd95_per_class]
+    return mean_loss, mean_ce, mean_dice_loss, mean_dice_per_class, mean_hd95_per_class
 
 
 def main():
@@ -299,6 +359,7 @@ def main():
                 'loss': f'{loss.item():.4f}',
                 'ce': f'{ce_val:.4f}',
                 'dice_loss': f'{dice_val:.4f}',
+                'dice': f'{float(np.mean(batch_dice)):.4f}',  # actual Dice SCORE, not dice_loss (1-Dice)
             })
 
             if step % cfg.print_interval == 0:
@@ -337,7 +398,7 @@ def main():
         )
 
         if epoch % cfg.val_interval == 0:
-            val_loss, val_ce, val_dice_loss, dice_per_class = validate(
+            val_loss, val_ce, val_dice_loss, dice_per_class, hd95_per_class = validate(
                 model, val_loader, criterion, cfg.num_classes, device
             )
             mean_dice = float(np.mean(dice_per_class))
@@ -345,6 +406,7 @@ def main():
                 f"  val_loss        : {val_loss:.4f}  (ce {val_ce:.4f} + dice_loss {val_dice_loss:.4f})\n"
                 f"  val_dice/class  : {_format_per_class(dice_per_class)}\n"
                 f"  val_mean_dice   : {mean_dice:.4f}\n"
+                f"  val_hd95/class  : {_format_per_class(hd95_per_class)} (voxels; n/a = class absent from GT this epoch)\n"
             )
 
             if mean_dice > best_val_dice:
